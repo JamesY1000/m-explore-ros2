@@ -39,15 +39,10 @@
 #include <explore/explore.h>
 
 #include <thread>
-
-inline static bool same_point(const geometry_msgs::msg::Point& one,
-                              const geometry_msgs::msg::Point& two)
-{
-  double dx = one.x - two.x;
-  double dy = one.y - two.y;
-  double dist = sqrt(dx * dx + dy * dy);
-  return dist < 0.01;
-}
+#include <algorithm>
+#include <exception>
+#include <mutex>
+#include <nav2_costmap_2d/cost_values.hpp>
 
 namespace explore
 {
@@ -57,22 +52,19 @@ Explore::Explore()
   , tf_buffer_(this->get_clock())
   , tf_listener_(tf_buffer_)
   , costmap_client_(*this, &tf_buffer_)
-  , prev_distance_(0)
   , last_markers_count_(0)
 {
-  double timeout;
   double min_frontier_size;
   this->declare_parameter<float>("planner_frequency", 1.0);
-  this->declare_parameter<float>("progress_timeout", 30.0);
   this->declare_parameter<bool>("visualize", false);
   this->declare_parameter<float>("potential_scale", 1e-3);
   this->declare_parameter<float>("orientation_scale", 0.0);
   this->declare_parameter<float>("gain_scale", 1.0);
   this->declare_parameter<float>("min_frontier_size", 0.5);
   this->declare_parameter<bool>("return_to_init", false);
+  this->declare_parameter<double>("roi_weight", 1.0);
 
   this->get_parameter("planner_frequency", planner_frequency_);
-  this->get_parameter("progress_timeout", timeout);
   this->get_parameter("visualize", visualize_);
   this->get_parameter("potential_scale", potential_scale_);
   this->get_parameter("orientation_scale", orientation_scale_);
@@ -80,8 +72,8 @@ Explore::Explore()
   this->get_parameter("min_frontier_size", min_frontier_size);
   this->get_parameter("return_to_init", return_to_init_);
   this->get_parameter("robot_base_frame", robot_base_frame_);
+  this->get_parameter("roi_weight", roi_weight_);
 
-  progress_timeout_ = timeout;
   move_base_client_ =
       rclcpp_action::create_client<nav2_msgs::action::NavigateToPose>(
           this, ACTION_NAME);
@@ -97,6 +89,18 @@ Explore::Explore()
                                                                      "s",
                                                                      10);
   }
+
+  // ExploreToPose action server
+  explore_to_pose_server_ = rclcpp_action::create_server<rs1_interfaces::action::ExploreToPose>(
+      this,
+      "explore_to_pose",
+      std::bind(&Explore::exploreToPoseRequestCb, this,
+                std::placeholders::_1, std::placeholders::_2),
+      std::bind(&Explore::exploreToPoseCancelRequestCb, this,
+                std::placeholders::_1),
+      std::bind(&Explore::exploreToPoseAcceptedCb, this,
+                std::placeholders::_1));
+
 
   // Publisher for exploration status
   rclcpp::QoS status_qos(10);
@@ -132,11 +136,17 @@ Explore::Explore()
   exploring_timer_ = this->create_wall_timer(
       std::chrono::milliseconds((uint16_t)(1000.0 / planner_frequency_)),
       [this]() { makePlan(); });
-  // Start exploration right away
-  auto status_msg = explore_lite_msgs::msg::ExploreStatus();
-  status_msg.status = explore_lite_msgs::msg::ExploreStatus::EXPLORATION_STARTED;
-  status_pub_->publish(status_msg);
-  makePlan();
+
+  // Cancel the timer so it starts off action call. Reenable it when we starting exploration
+  exploring_timer_->cancel();
+
+  RCLCPP_INFO(this->get_logger(), "Waiting for an ExploreToPose goal");
+
+  // // Start exploration right away
+  // auto status_msg = explore_lite_msgs::msg::ExploreStatus();
+  // status_msg.status = explore_lite_msgs::msg::ExploreStatus::EXPLORATION_STARTED;
+  // status_pub_->publish(status_msg);
+  // makePlan();
 }
 
 Explore::~Explore()
@@ -228,21 +238,67 @@ void Explore::visualizeFrontiers(
 
 void Explore::makePlan()
 {
+  // Make sure it only starts when it receives an active goal handle
+  if (!explore_to_pose_goal_handle_ || !explore_to_pose_goal_handle_->is_active() ||
+      explore_to_pose_goal_handle_->is_canceling() || exploring_timer_->is_canceled())
+  {
+    return;
+  }
+
   // find frontiers
   auto pose = costmap_client_.getRobotPose();
+  auto feedback =
+      std::make_shared<rs1_interfaces::action::ExploreToPose::Feedback>();
+  feedback->stage = final_navigation_ ? "navigating_to_roi" : "exploring";
+  feedback->distance_to_target = static_cast<float>(std::hypot(
+      pose.position.x - target_pose_.pose.position.x,
+      pose.position.y - target_pose_.pose.position.y));
+  explore_to_pose_goal_handle_->publish_feedback(feedback);
+
+  // Finish one navigation leg before choosing another destination.
+  // goal_active_ also covers a request awaiting acceptance by Nav2.
+  if (goal_active_) {
+    return;
+  }
+  if (!roi_attempted_since_frontier_ && roiIsKnownFree()) {
+    RCLCPP_INFO(logger_, "ROI is known free; attempting direct navigation");
+    sendNavigationGoal(target_pose_, true);
+    return;
+  }
+
   // get frontiers sorted according to cost
   auto frontiers = search_.searchFrom(pose.position);
+
+  const auto &roi = target_pose_.pose.position;
+
+  // Add penalty for frontiers away from the ROI - just take euclidean distance for now
+  for (auto &frontier : frontiers)
+  {
+    const double distance_to_roi = std::hypot(
+      frontier.centroid.x - roi.x,
+      frontier.centroid.y - roi.y
+    );
+
+    frontier.cost += roi_weight_ * distance_to_roi;
+  }
+
+  // Resort now with updated costs
+  // Re-sort because the costs have changed.
+  std::sort(frontiers.begin(), frontiers.end(),
+    [](const frontier_exploration::Frontier &a,
+      const frontier_exploration::Frontier &b)
+      {
+        return a.cost < b.cost;
+      }
+  );
+
   RCLCPP_DEBUG(logger_, "found %lu frontiers", frontiers.size());
   for (size_t i = 0; i < frontiers.size(); ++i) {
     RCLCPP_DEBUG(logger_, "frontier %zd cost: %f", i, frontiers[i].cost);
   }
 
   if (frontiers.empty()) {
-    RCLCPP_WARN(logger_, "No frontiers found, stopping.");
-    auto status_msg = explore_lite_msgs::msg::ExploreStatus();
-    status_msg.status = explore_lite_msgs::msg::ExploreStatus::EXPLORATION_COMPLETE;
-    status_pub_->publish(status_msg);
-    stop(true);
+    finishExploration(false, "No frontiers remain and the ROI was not reached");
     return;
   }
 
@@ -258,76 +314,16 @@ void Explore::makePlan()
                          return goalOnBlacklist(f.centroid);
                        });
   if (frontier == frontiers.end()) {
-    RCLCPP_WARN(logger_, "All frontiers traversed/tried out, stopping.");
-    auto status_msg = explore_lite_msgs::msg::ExploreStatus();
-    status_msg.status = explore_lite_msgs::msg::ExploreStatus::EXPLORATION_COMPLETE;
-    status_pub_->publish(status_msg);
-    stop(true);
+    finishExploration(false, "No usable frontiers remain and the ROI was not reached");
     return;
   }
   geometry_msgs::msg::Point target_position = frontier->centroid;
 
-  // time out if we are not making any progress
-  bool same_goal = same_point(prev_goal_, target_position);
-
-  prev_goal_ = target_position;
-  if (!same_goal || prev_distance_ > frontier->min_distance) {
-    // we have different goal or we made some progress
-    last_progress_ = this->now();
-    prev_distance_ = frontier->min_distance;
-  }
-  // black list if we've made no progress for a long time
-  if (goal_active_ &&
-      (this->now() - last_progress_ >
-       tf2::durationFromSec(progress_timeout_)) &&
-      !resuming_) {
-    frontier_blacklist_.push_back(target_position);
-    RCLCPP_DEBUG(logger_, "Adding current goal to black list");
-    makePlan();
-    return;
-  }
-
-  // ensure only first call of makePlan was set resuming to true
-  if (resuming_) {
-    resuming_ = false;
-  }
-
-  // we don't need to do anything if we still pursuing the same goal
-  if (same_goal && goal_active_) {
-    return;
-  }
-
-  RCLCPP_DEBUG(logger_, "Sending goal to move base nav2");
-
-  // send goal to move_base if we have something new to pursue
-  auto goal = nav2_msgs::action::NavigateToPose::Goal();
-  goal.pose.pose.position = target_position;
-  goal.pose.pose.orientation.w = 1.;
-  goal.pose.header.frame_id = costmap_client_.getGlobalFrameID();
-  goal.pose.header.stamp = this->now();
-
-  goal_active_ = true;
-  auto send_goal_options = rclcpp_action::Client<
-      nav2_msgs::action::NavigateToPose>::SendGoalOptions();
-
-  send_goal_options.goal_response_callback =
-      [this](const NavigationGoalHandle::SharedPtr& goal_handle) {
-        if (!goal_handle) {
-          RCLCPP_ERROR(logger_, "Goal was REJECTED by the action server");
-          goal_active_ = false;
-        } else {
-          active_goal_id_ = goal_handle->get_goal_id();
-          RCLCPP_DEBUG(logger_, "Goal ACCEPTED, uuid: %s",
-            rclcpp_action::to_string(active_goal_id_).c_str());
-        }
-      };
-
-  send_goal_options.result_callback =
-      [this,
-       target_position](const NavigationGoalHandle::WrappedResult& result) {
-        reachedGoal(result, target_position);
-      };
-  move_base_client_->async_send_goal(goal, send_goal_options);
+  geometry_msgs::msg::PoseStamped frontier_pose;
+  frontier_pose.pose.position = target_position;
+  frontier_pose.pose.orientation.w = 1.0;
+  frontier_pose.header.frame_id = costmap_client_.getGlobalFrameID();
+  sendNavigationGoal(frontier_pose, false);
 }
 
 void Explore::returnToInitialPose()
@@ -375,36 +371,16 @@ bool Explore::goalOnBlacklist(const geometry_msgs::msg::Point& goal)
 
 void Explore::reachedGoal(const NavigationGoalHandle::WrappedResult& result,
                           const geometry_msgs::msg::Point& frontier_goal) {
-  // discard stale callbacks from previously preempted goals
-  if (result.goal_id != active_goal_id_) {
-    return;
-  }
-
   goal_active_ = false;
   switch (result.code) {
     case rclcpp_action::ResultCode::SUCCEEDED:
       RCLCPP_DEBUG(logger_, "Goal was successful");
-      last_progress_ = this->now();
-      prev_distance_ = 0;
+      roi_attempted_since_frontier_ = false;
       break;
     case rclcpp_action::ResultCode::ABORTED:
-#ifdef NAV2_RESULT_HAS_ERROR_CODE
-      if (result.result && result.result->error_code != 0) {
-        RCLCPP_DEBUG(logger_, "Goal aborted with error_code=%d (%s) — blacklisting frontier",
-                     result.result->error_code,
-                     result.result->error_msg.c_str());
-        frontier_blacklist_.push_back(frontier_goal);
-      } else {
-        RCLCPP_DEBUG(logger_, "Goal aborted with error_code=0 — likely a preemption, not blacklisting");
-      }
-#else
-      // Humble: no error_code field, blacklist unconditionally on abort
-      RCLCPP_DEBUG(logger_, "Goal aborted — blacklisting frontier");
+      RCLCPP_DEBUG(logger_, "Goal aborted; blacklisting frontier");
       frontier_blacklist_.push_back(frontier_goal);
-#endif
-      // If it was aborted probably because we've found another frontier goal,
-      // so just return and don't make plan again
-      return;
+      break;
     case rclcpp_action::ResultCode::CANCELED:
       RCLCPP_DEBUG(logger_, "Goal was canceled");
       // If goal canceled might be because exploration stopped from topic. Don't make new plan.
@@ -413,16 +389,7 @@ void Explore::reachedGoal(const NavigationGoalHandle::WrappedResult& result,
       RCLCPP_WARN(logger_, "Unknown result code from move base nav2");
       break;
   }
-  // find new goal immediately regardless of planning frequency.
-  // execute via timer to prevent dead lock in move_base_client (this is
-  // callback for sendGoal, which is called in makePlan). the timer must live
-  // until callback is executed.
-  // oneshot_ = relative_nh_.createTimer(
-  //     ros::Duration(0, 0), [this](const ros::TimerEvent&) { makePlan(); },
-  //     true);
-
-  // Because of the 1-thread-executor nature of ros2 I think timer is not
-  // needed.
+  // This node uses the default mutually exclusive callback group.
   makePlan();
 }
 
@@ -438,7 +405,6 @@ void Explore::stop(bool finished_exploring)
 {
   RCLCPP_INFO(logger_, "Exploration stopped.");
 
-  goal_active_ = false;
   // Only publish paused status if manually stopped (not finished exploring)
   if (!finished_exploring) {
     auto status_msg = explore_lite_msgs::msg::ExploreStatus();
@@ -446,8 +412,10 @@ void Explore::stop(bool finished_exploring)
     status_pub_->publish(status_msg);
   }
 
-  move_base_client_->async_cancel_all_goals();
   exploring_timer_->cancel();
+  if (navigation_goal_handle_) {
+    move_base_client_->async_cancel_goal(navigation_goal_handle_);
+  }
 
   if (return_to_init_ && finished_exploring) {
     returnToInitialPose();
@@ -456,7 +424,14 @@ void Explore::stop(bool finished_exploring)
 
 void Explore::resume()
 {
-  resuming_ = true;
+  // Make sure it only starts when it receives an active goal handle
+  if (!explore_to_pose_goal_handle_ || !explore_to_pose_goal_handle_->is_active() ||
+      explore_to_pose_goal_handle_->is_canceling())
+  {
+    return;
+  }
+
+  roi_attempted_since_frontier_ = false;
   RCLCPP_INFO(logger_, "Exploration resuming.");
   auto status_msg = explore_lite_msgs::msg::ExploreStatus();
   status_msg.status = explore_lite_msgs::msg::ExploreStatus::EXPLORATION_IN_PROGRESS;
@@ -465,6 +440,191 @@ void Explore::resume()
   exploring_timer_->reset();
   // Resume immediately
   makePlan();
+}
+
+rclcpp_action::GoalResponse Explore::exploreToPoseRequestCb(
+    const rclcpp_action::GoalUUID &uuid,
+    std::shared_ptr<const rs1_interfaces::action::ExploreToPose::Goal> goal)
+{
+  (void)uuid;
+  // Reject if another exploration task is still active
+  if (explore_to_pose_goal_handle_ && explore_to_pose_goal_handle_->is_active())
+  {
+    RCLCPP_WARN(logger_, "Rejecting goal: exploration is already active");
+    return rclcpp_action::GoalResponse::REJECT;
+  }
+
+  // Reject an invalid target pose
+  if (!validPose(goal->target_pose))
+  {
+    RCLCPP_WARN(logger_, "Rejecting goal: target pose is invalid");
+    return rclcpp_action::GoalResponse::REJECT;
+  }
+
+  // Initially require the target frame to equal costmap_client_.getGlobalFrameID()
+  const auto map_frame = costmap_client_.getGlobalFrameID();
+  if (goal->target_pose.header.frame_id.empty() || goal->target_pose.header.frame_id != map_frame)
+  {
+    RCLCPP_WARN(logger_, "Rejecting goal: target frame must be '%s'", map_frame.c_str());
+    return rclcpp_action::GoalResponse::REJECT;
+  }
+
+  // Check move_base_client_->action_server_is_ready()
+  if (!move_base_client_->action_server_is_ready()) {
+    RCLCPP_WARN(logger_, "Rejecting goal: Nav2 server unavailable");
+    return rclcpp_action::GoalResponse::REJECT;
+  }
+
+  // Otherwise if all checks complete, return ACCEPT_AND_EXECUTE
+  return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+}
+
+rclcpp_action::CancelResponse Explore::exploreToPoseCancelRequestCb(
+  const std::shared_ptr<rclcpp_action::ServerGoalHandle<rs1_interfaces::action::ExploreToPose>> goal_handle)
+{
+  // Keep cancellation unsupported until navigation cleanup is implemented.
+  (void)goal_handle;
+  RCLCPP_WARN(logger_, "Exploration cancellation is not implemented yet");
+  return rclcpp_action::CancelResponse::REJECT;
+}
+
+void Explore::exploreToPoseAcceptedCb(const std::shared_ptr<rclcpp_action::ServerGoalHandle<rs1_interfaces::action::ExploreToPose>> goal_handle)
+{
+  // Start exploration with target pose and enable timer
+  explore_to_pose_goal_handle_ = goal_handle;
+  target_pose_ = goal_handle->get_goal()->target_pose;
+
+  final_navigation_ = false;
+  roi_attempted_since_frontier_ = false;
+  goal_active_ = false;
+  navigation_goal_handle_.reset();
+  frontier_blacklist_.clear();
+
+  start(); // Currently this publises EXPLORATION_STARTED
+  exploring_timer_->reset(); // Reenables the makePlan() calls
+}
+
+
+bool Explore::roiIsKnownFree()
+{
+  auto *map = costmap_client_.getCostmap();
+  std::lock_guard<nav2_costmap_2d::Costmap2D::mutex_t> lock(*map->getMutex());
+  unsigned int mx, my;
+  const auto &position = target_pose_.pose.position;
+  return map->worldToMap(position.x, position.y, mx, my) &&
+         map->getCost(mx, my) == nav2_costmap_2d::FREE_SPACE;
+}
+
+void Explore::sendNavigationGoal(
+    const geometry_msgs::msg::PoseStamped &pose, bool to_roi)
+{
+  final_navigation_ = to_roi;
+  if (to_roi) {
+    roi_attempted_since_frontier_ = true;
+  }
+  goal_active_ = true;
+
+  nav2_msgs::action::NavigateToPose::Goal goal;
+  goal.pose = pose;
+  goal.pose.header.stamp = this->now();
+
+  rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions options;
+  options.goal_response_callback =
+      [this, pose, to_roi](NavigationGoalHandle::SharedPtr handle) {
+        if (!handle) {
+          goal_active_ = false;
+          final_navigation_ = false;
+          navigation_goal_handle_.reset();
+          if (!to_roi) {
+            frontier_blacklist_.push_back(pose.pose.position);
+          }
+          RCLCPP_WARN(logger_, "Nav2 rejected %s goal",
+                      to_roi ? "ROI" : "frontier");
+          return;
+        }
+        navigation_goal_handle_ = handle;
+
+        // A pause may have arrived while Nav2 was accepting the goal.
+        if (exploring_timer_->is_canceled()) {
+          move_base_client_->async_cancel_goal(handle);
+        }
+      };
+
+  options.result_callback =
+      [this, pose, to_roi](
+          const NavigationGoalHandle::WrappedResult &result) {
+        if (!explore_to_pose_goal_handle_) {
+          return;
+        }
+        navigation_goal_handle_.reset();
+
+        if (!to_roi) {
+          reachedGoal(result, pose.pose.position);
+          return;
+        }
+
+        goal_active_ = false;
+        final_navigation_ = false;
+        if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
+          finishExploration(true, "Reached the ROI");
+        } else {
+          RCLCPP_WARN(logger_, "ROI navigation did not succeed; resuming exploration");
+          makePlan();
+        }
+      };
+
+  try {
+    move_base_client_->async_send_goal(goal, options);
+  } catch (const std::exception &error) {
+    goal_active_ = false;
+    final_navigation_ = false;
+    navigation_goal_handle_.reset();
+    if (!to_roi) {
+      frontier_blacklist_.push_back(pose.pose.position);
+    }
+    RCLCPP_ERROR(logger_, "Could not send navigation goal: %s", error.what());
+  }
+}
+
+void Explore::finishExploration(bool success, const std::string &message)
+{
+  if (!explore_to_pose_goal_handle_) {
+    return;
+  }
+
+  exploring_timer_->cancel();
+  goal_active_ = false;
+  final_navigation_ = false;
+  navigation_goal_handle_.reset();
+
+  auto result = std::make_shared<rs1_interfaces::action::ExploreToPose::Result>();
+  result->message = message;
+  if (success) {
+    explore_to_pose_goal_handle_->succeed(result);
+    auto status = explore_lite_msgs::msg::ExploreStatus();
+    status.status = explore_lite_msgs::msg::ExploreStatus::EXPLORATION_COMPLETE;
+    status_pub_->publish(status);
+    RCLCPP_INFO(logger_, "%s", message.c_str());
+  } else {
+    explore_to_pose_goal_handle_->abort(result);
+    RCLCPP_WARN(logger_, "%s", message.c_str());
+  }
+  explore_to_pose_goal_handle_.reset();
+}
+
+bool Explore::validPose(const geometry_msgs::msg::PoseStamped &pose)
+{
+  const auto q = pose.pose.orientation;
+  const double quaternion_norm_squared = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+
+  // Check position and orientation
+  if (!std::isfinite(pose.pose.position.x) || !std::isfinite(pose.pose.position.y) || !std::isfinite(pose.pose.position.z) ||
+      !std::isfinite(quaternion_norm_squared) || std::abs(quaternion_norm_squared - 1.0) > 1e-3)
+  {
+    return false;
+  }
+
+  return true;
 }
 
 }  // namespace explore

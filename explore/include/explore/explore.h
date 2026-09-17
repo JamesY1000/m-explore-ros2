@@ -54,6 +54,7 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 
 #include "nav2_msgs/action/navigate_to_pose.hpp"
+#include "rs1_interfaces/action/explore_to_pose.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
 
 using namespace std::placeholders;
@@ -128,24 +129,45 @@ private:
   void resumeCallback(const std_msgs::msg::Bool::SharedPtr msg);
 
   std::vector<geometry_msgs::msg::Point> frontier_blacklist_;
-  geometry_msgs::msg::Point prev_goal_;
-  double prev_distance_;
-  rclcpp::Time last_progress_;
   size_t last_markers_count_;
 
   geometry_msgs::msg::Pose initial_pose_;
+  geometry_msgs::msg::PoseStamped target_pose_;
   void returnToInitialPose(void);
+
+  // ExploreToPose action server
+  rclcpp_action::Server<rs1_interfaces::action::ExploreToPose>::SharedPtr explore_to_pose_server_;
+  std::shared_ptr<rclcpp_action::ServerGoalHandle<rs1_interfaces::action::ExploreToPose>> explore_to_pose_goal_handle_;
+
+  rclcpp_action::GoalResponse exploreToPoseRequestCb(
+    const rclcpp_action::GoalUUID &uuid,
+    std::shared_ptr<const rs1_interfaces::action::ExploreToPose::Goal> goal);
+
+  rclcpp_action::CancelResponse exploreToPoseCancelRequestCb(
+    const std::shared_ptr<rclcpp_action::ServerGoalHandle<rs1_interfaces::action::ExploreToPose>> goal_handle);
+
+  void exploreToPoseAcceptedCb(const std::shared_ptr<rclcpp_action::ServerGoalHandle<rs1_interfaces::action::ExploreToPose>> goal_handle);
+
+  bool roiIsKnownFree();
+  void sendNavigationGoal(
+      const geometry_msgs::msg::PoseStamped &pose, bool to_roi);
+  void finishExploration(bool success, const std::string &message);
+
+  bool final_navigation_{false};
+  bool roi_attempted_since_frontier_{false};
+
+  bool validPose(const geometry_msgs::msg::PoseStamped &pose);
+
+
 
   // parameters
   double planner_frequency_;
   double potential_scale_, orientation_scale_, gain_scale_;
-  double progress_timeout_;
   bool visualize_;
   bool return_to_init_;
   std::string robot_base_frame_;
-  bool resuming_ = false;
   bool goal_active_{false};
-  rclcpp_action::GoalUUID active_goal_id_;
+  double roi_weight_{1.0};
 };
 }  // namespace explore
 

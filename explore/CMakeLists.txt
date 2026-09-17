@@ -44,6 +44,8 @@ find_package(map_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(nav2_costmap_2d REQUIRED)
 find_package(explore_lite_msgs REQUIRED)
+find_package(rs1_interfaces REQUIRED)
+find_package(rclcpp_action REQUIRED)
 
 set(DEPENDENCIES
   rclcpp
@@ -99,6 +101,8 @@ target_link_libraries(explore PUBLIC
   rclcpp::rclcpp
   tf2::tf2
   tf2_ros::tf2_ros
+  ${rs1_interfaces_TARGETS}
+  rclcpp_action::rclcpp_action
 )
 
 if(nav2_msgs_VERSION VERSION_GREATER_EQUAL "1.3.0")
@@ -142,6 +146,8 @@ ament_export_dependencies(
   tf2
   tf2_ros
   visualization_msgs
+  rs1_interfaces
+  rclcpp_action
 )
 
 ament_export_include_directories(include)
