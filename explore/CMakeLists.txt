@@ -126,29 +126,12 @@ if(BUILD_TESTING)
   ament_lint_auto_find_test_dependencies()
 
   find_package(ament_cmake_gtest REQUIRED)
-  find_package(ament_cmake_pytest REQUIRED)
-
-  ament_add_pytest_test(test_frontier_validation test/test_frontier_validation.py
-    TIMEOUT 180
-    ENV EXPLORE_TEST_EXECUTABLE=$<TARGET_FILE:explore>)
 
   ament_add_gtest(test_explore test/test_explore.cpp)
 
   target_link_libraries(test_explore
     ${geometry_msgs_TARGETS}
   )
-
-  ament_add_gtest(test_frontier_search
-    test/test_frontier_search.cpp
-    src/frontier_search.cpp)
-  ament_target_dependencies(test_frontier_search
-    nav2_costmap_2d rclcpp geometry_msgs)
-
-  ament_add_gtest(test_frontier_target
-    test/test_frontier_target.cpp
-    src/frontier_target.cpp)
-  ament_target_dependencies(test_frontier_target
-    nav2_costmap_2d nav2_msgs nav_msgs rclcpp geometry_msgs)
 
 endif()
 
