@@ -1,6 +1,7 @@
 #include <explore/costmap_tools.h>
 #include <explore/frontier_search.h>
 
+#include <cmath>
 #include <geometry_msgs/msg/point.hpp>
 #include <mutex>
 
@@ -101,15 +102,15 @@ Frontier FrontierSearch::buildNewFrontier(unsigned int initial_cell,
 {
   // initialize frontier structure
   Frontier output;
-  output.centroid.x = 0;
-  output.centroid.y = 0;
   output.size = 1;
-  output.min_distance = std::numeric_limits<double>::infinity();
 
   // record initial contact point for frontier
   unsigned int ix, iy;
   costmap_->indexToCells(initial_cell, ix, iy);
   costmap_->mapToWorld(ix, iy, output.initial.x, output.initial.y);
+  output.points.push_back(output.initial);
+  output.centroid = output.initial;
+  output.middle = output.initial;
 
   // push initial gridcell onto queue
   std::queue<unsigned int> bfs;
@@ -120,6 +121,8 @@ Frontier FrontierSearch::buildNewFrontier(unsigned int initial_cell,
   double reference_x, reference_y;
   costmap_->indexToCells(reference, rx, ry);
   costmap_->mapToWorld(rx, ry, reference_x, reference_y);
+  output.min_distance = std::hypot(reference_x - output.initial.x,
+                                   reference_y - output.initial.y);
 
   while (!bfs.empty()) {
     unsigned int idx = bfs.front();
@@ -191,8 +194,8 @@ bool FrontierSearch::isNewFrontierCell(unsigned int idx,
 
 double FrontierSearch::frontierCost(const Frontier& frontier)
 {
-  return (potential_scale_ * frontier.min_distance *
-          costmap_->getResolution()) -
+  // min_distance is already in world metres.
+  return (potential_scale_ * frontier.min_distance) -
          (gain_scale_ * frontier.size * costmap_->getResolution());
 }
 }  // namespace frontier_exploration

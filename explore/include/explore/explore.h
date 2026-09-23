@@ -40,6 +40,7 @@
 
 #include <explore/costmap_client.h>
 #include <explore/frontier_search.h>
+#include <explore/frontier_target.h>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <tf2_ros/transform_listener.hpp>
 
@@ -54,6 +55,8 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 
 #include "nav2_msgs/action/navigate_to_pose.hpp"
+#include "nav2_msgs/action/compute_path_to_pose.hpp"
+#include "nav2_msgs/srv/get_costmap.hpp"
 #include "rs1_interfaces/action/explore_to_pose.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
 
@@ -104,7 +107,8 @@ private:
   // goal_response_callback(std::shared_future<NavigationGoalHandle::SharedPtr>
   // future);
   void reachedGoal(const NavigationGoalHandle::WrappedResult& result,
-                   const geometry_msgs::msg::Point& frontier_goal);
+                   const geometry_msgs::msg::Point& frontier_goal,
+                   const geometry_msgs::msg::Point& destination);
 
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
       marker_array_publisher_;
@@ -121,6 +125,29 @@ private:
   Costmap2DClient costmap_client_;
   rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SharedPtr
       move_base_client_;
+  using PlanningGoalHandle =
+      rclcpp_action::ClientGoalHandle<nav2_msgs::action::ComputePathToPose>;
+  rclcpp_action::Client<nav2_msgs::action::ComputePathToPose>::SharedPtr planner_client_;
+  rclcpp::Client<nav2_msgs::srv::GetCostmap>::SharedPtr navigation_costmap_client_;
+  PlanningGoalHandle::SharedPtr planning_goal_handle_;
+  rclcpp::TimerBase::SharedPtr validation_timer_;
+  std::shared_ptr<nav2_msgs::msg::Costmap> validation_costmap_;
+  std::vector<FrontierTarget> validation_targets_;
+  DirectedFrontierOptions frontier_options_;
+  bool validation_detour_announced_{false};
+  size_t validation_target_index_{0};
+  uint64_t validation_generation_{0};
+  int64_t costmap_request_id_{-1};
+  bool validation_active_{false};
+  unsigned int empty_validation_attempts_{0};
+  std::chrono::steady_clock::time_point validation_retry_after_{};
+  std::chrono::steady_clock::time_point validation_deadline_;
+
+  void validateFrontiers(const std::vector<frontier_exploration::Frontier> &frontiers);
+  void validateNextTarget(uint64_t generation);
+  bool validationIsCurrent(uint64_t generation) const;
+  void cancelFrontierValidation();
+
   frontier_exploration::FrontierSearch search_;
   rclcpp::TimerBase::SharedPtr exploring_timer_;
   // rclcpp::TimerBase::SharedPtr oneshot_;
@@ -129,6 +156,8 @@ private:
   void resumeCallback(const std_msgs::msg::Bool::SharedPtr msg);
 
   std::vector<geometry_msgs::msg::Point> frontier_blacklist_;
+  // Successful dispatched endpoints, oldest first; preserved across pause/resume.
+  std::vector<geometry_msgs::msg::Point> recent_frontier_goals_;
   size_t last_markers_count_;
 
   geometry_msgs::msg::Pose initial_pose_;
@@ -150,7 +179,8 @@ private:
 
   bool roiIsKnownFree();
   void sendNavigationGoal(
-      const geometry_msgs::msg::PoseStamped &pose, bool to_roi);
+      const geometry_msgs::msg::PoseStamped &pose, bool to_roi,
+      const geometry_msgs::msg::Point &frontier_identity = geometry_msgs::msg::Point());
   void finishExploration(bool success, const std::string &message);
 
   bool final_navigation_{false};
@@ -168,6 +198,9 @@ private:
   std::string robot_base_frame_;
   bool goal_active_{false};
   double roi_weight_{1.0};
+  double frontier_endpoint_tolerance_{0.5};
+  int frontier_validation_timeout_{90};
+  int recent_frontier_history_size_{20};
 };
 }  // namespace explore
 

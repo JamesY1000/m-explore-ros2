@@ -38,6 +38,7 @@
 #include <explore/costmap_client.h>
 #include <unistd.h>
 
+#include <cmath>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -221,8 +222,15 @@ void Costmap2DClient::updatePartialMap(
 
 geometry_msgs::msg::Pose Costmap2DClient::getRobotPose() const
 {
+  geometry_msgs::msg::Pose pose;
+  getRobotPose(pose);
+  return pose;
+}
+
+bool Costmap2DClient::getRobotPose(geometry_msgs::msg::Pose &pose) const
+{
   geometry_msgs::msg::PoseStamped robot_pose;
-  geometry_msgs::msg::Pose empty_pose;
+  robot_pose.pose.orientation.w = 1.0;
   robot_pose.header.frame_id = robot_base_frame_;
   robot_pose.header.stamp = node_.now();
 
@@ -237,24 +245,32 @@ geometry_msgs::msg::Pose Costmap2DClient::getRobotPose() const
                           "No Transform available Error looking up robot pose: "
                           "%s\n",
                           ex.what());
-    return empty_pose;
+    return false;
   } catch (tf2::ConnectivityException& ex) {
     RCLCPP_ERROR_THROTTLE(node_.get_logger(), clk, 1000,
                           "Connectivity Error looking up robot pose: %s\n",
                           ex.what());
-    return empty_pose;
+    return false;
   } catch (tf2::ExtrapolationException& ex) {
     RCLCPP_ERROR_THROTTLE(node_.get_logger(), clk, 1000,
                           "Extrapolation Error looking up robot pose: %s\n",
                           ex.what());
-    return empty_pose;
+    return false;
   } catch (tf2::TransformException& ex) {
     RCLCPP_ERROR_THROTTLE(node_.get_logger(), clk, 1000, "Other error: %s\n",
                           ex.what());
-    return empty_pose;
+    return false;
   }
 
-  return robot_pose.pose;
+  const auto &position = robot_pose.pose.position;
+  if (!std::isfinite(position.x) || !std::isfinite(position.y) ||
+      !std::isfinite(position.z)) {
+    RCLCPP_ERROR_THROTTLE(node_.get_logger(), clk, 1000,
+                         "Robot transform has nonfinite position");
+    return false;
+  }
+  pose = robot_pose.pose;
+  return true;
 }
 
 std::array<unsigned char, 256> init_translation_table()
