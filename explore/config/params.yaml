@@ -1,14 +1,32 @@
 /**:
   ros__parameters:
     robot_base_frame: base_link
-    return_to_init: true
+    return_to_init: false
     costmap_topic: map
     costmap_updates_topic: map_updates
     visualize: true
     planner_frequency: 0.15
-    progress_timeout: 30.0
     potential_scale: 3.0
     orientation_scale: 0.0
     gain_scale: 1.0
     transform_tolerance: 0.3
     min_frontier_size: 0.75
+    roi_weight: 10.0
+    # Exclude frontier goals already close to the robot, including detours.
+    # Keep above Nav2's XY arrival tolerance with room for planner shifts.
+    minimum_frontier_distance: 2.0
+    # Suppress destinations near recently reached approach points, across all tiers.
+    # Radius 0 disables suppression. History resets for each ExploreToPose task.
+    frontier_revisit_radius: 2.5
+    recent_frontier_history_size: 20
+    # Prefer nearby ROI-progress targets, then farther progress, then detours.
+    preferred_frontier_distance: 20.0
+    roi_min_progress: 2.0
+    roi_allow_backtracking: true
+    # Cap the boundary-length reward so large frontiers cannot dominate travel cost.
+    frontier_gain_cap: 5.0
+    # Maximum XY displacement of a planned endpoint from its requested frontier.
+    frontier_endpoint_tolerance: 0.5
+
+    # Total wall-clock seconds available for validating one candidate batch.
+    frontier_validation_timeout: 90

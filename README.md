@@ -59,6 +59,28 @@ ros2 launch explore_lite explore.launch.py
 
 You can open rviz2 and add the exploration frontiers marker (topic is `explore/frontiers`) to see the algorithm working and the frontier chosen to explore.
 
+### Exploration logging
+The exploration launch defaults to `log_level:=info`. Normal output is limited to
+startup/readiness, exploration start/stop/resume, accepted navigation destinations,
+and completion. Candidate filtering, scores, costmap snapshots, detour selection,
+and routine candidate rejection reasons are available at `debug`.
+
+Warnings remain visible when exploration cannot progress, navigation fails, or a
+request cannot be accepted. Errors report transform/data failures and navigation
+request exceptions. Repeated TF failures, missing Nav2 services, and map-update
+bounds warnings are throttled to once every five seconds per logging site using
+the node clock (simulation time when `use_sim_time` is enabled).
+
+```bash
+ros2 launch explore_lite explore.launch.py namespace:=parrot1 \
+  robot_base_frame:=parrot1_base_link use_sim_time:=true log_level:=info
+```
+
+Use `log_level:=debug` for diagnostics or `log_level:=warn` to hide normal progress.
+When including this launch file from another launch file, forward `log_level` in
+`launch_arguments`. If creating the executable's `Node` directly, use
+`ros_arguments=["--log-level", "info"]`; the launch argument is not a ROS parameter.
+
 ### Additional features
 #### Stop/Resume exploration
 By default the exploration node will start right away the frontier-based exploration algorithm. Alternatively, you can stop the exploration by publishing to a `False` to `explore/resume` topic. This will stop the exploration and the robot will stop moving. You can resume the exploration by publishing to `True` to `explore/resume`.

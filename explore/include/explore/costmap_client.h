@@ -70,6 +70,10 @@ public:
    */
   geometry_msgs::msg::Pose getRobotPose() const;
 
+  // Explicit success flag for decisions that must not use a default origin
+  // when localization/TF is unavailable. Output is assigned only on success.
+  bool getRobotPose(geometry_msgs::msg::Pose &pose) const;
+
   /**
    * @brief Return a pointer to the "master" costmap which receives updates from
    * all the layers.

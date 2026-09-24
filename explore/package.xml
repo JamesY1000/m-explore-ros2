@@ -13,6 +13,10 @@
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>ament_index_python</test_depend>
+  <test_depend>action_msgs</test_depend>
+  <test_depend>rclpy</test_depend>
   <test_depend>ament_lint_common</test_depend>
   <depend>explore_lite_msgs</depend>
   <depend>geometry_msgs</depend>
@@ -25,6 +29,8 @@
   <depend>tf2</depend>
   <depend>tf2_ros</depend>
   <depend>visualization_msgs</depend>
+  <depend>rs1_interfaces</depend>
+  <depend>rclcpp_action</depend>
 
   <export>
     <build_type>ament_cmake</build_type>

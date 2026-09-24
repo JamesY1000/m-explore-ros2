@@ -15,6 +15,8 @@ def generate_launch_description():
     )
     use_sim_time = LaunchConfiguration("use_sim_time")
     namespace = LaunchConfiguration("namespace")
+    robot_base_frame = LaunchConfiguration("robot_base_frame")
+    log_level = LaunchConfiguration("log_level")
 
     declare_use_sim_time_argument = DeclareLaunchArgument(
         "use_sim_time", default_value="true", description="Use simulation/Gazebo clock"
@@ -23,6 +25,19 @@ def generate_launch_description():
         "namespace",
         default_value="",
         description="Namespace for the explore node",
+    )
+
+    declare_robot_base_frame_argument = DeclareLaunchArgument(
+        "robot_base_frame",
+        default_value="base_link",
+        description="Robot base TF frame",
+    )
+
+    declare_log_level_argument = DeclareLaunchArgument(
+        "log_level",
+        default_value="info",
+        choices=["debug", "info", "warn", "error", "fatal"],
+        description="Explorer logging threshold; debug includes planning diagnostics",
     )
 
     # Map fully qualified names to relative ones so the node's namespace can be prepended.
@@ -36,11 +51,15 @@ def generate_launch_description():
         name="explore_node",
         namespace=namespace,
         executable="explore",
-        parameters=[config, {"use_sim_time": use_sim_time}],
+        parameters=[config, {"use_sim_time": use_sim_time,
+                             "robot_base_frame": robot_base_frame}],
         output="screen",
+        ros_arguments=["--log-level", log_level],
         remappings=remappings,
     )
     ld.add_action(declare_use_sim_time_argument)
     ld.add_action(declare_namespace_argument)
+    ld.add_action(declare_robot_base_frame_argument)
+    ld.add_action(declare_log_level_argument)
     ld.add_action(node)
     return ld
