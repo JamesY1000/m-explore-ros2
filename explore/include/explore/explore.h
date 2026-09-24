@@ -56,6 +56,7 @@
 
 #include "nav2_msgs/action/navigate_to_pose.hpp"
 #include "nav2_msgs/action/compute_path_to_pose.hpp"
+#include "nav2_msgs/action/back_up.hpp"
 #include "nav2_msgs/srv/get_costmap.hpp"
 #include "rs1_interfaces/action/explore_to_pose.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
@@ -139,7 +140,27 @@ private:
   uint64_t validation_generation_{0};
   int64_t costmap_request_id_{-1};
   bool validation_active_{false};
-  unsigned int empty_validation_attempts_{0};
+  // Ownership includes requests awaiting acceptance and cancellation awaiting a result.
+  bool planning_in_flight_{false};
+  bool planning_cancel_requested_{false};
+  bool planning_cancel_sent_{false};
+  bool navigation_cancel_requested_{false};
+  bool navigation_cancel_sent_{false};
+  uint64_t navigation_generation_{0};
+  unsigned int failed_validation_batches_{0};
+  bool retry_waiting_{false};
+  bool validation_start_blocked_{false};
+  std::string last_validation_failure_;
+
+  using BackupGoalHandle = rclcpp_action::ClientGoalHandle<nav2_msgs::action::BackUp>;
+  rclcpp_action::Client<nav2_msgs::action::BackUp>::SharedPtr backup_client_;
+  BackupGoalHandle::SharedPtr backup_goal_handle_;
+  bool backup_attempted_{false};
+  bool backup_in_flight_{false};
+  bool backup_cancel_requested_{false};
+  bool backup_cancel_sent_{false};
+  uint64_t backup_generation_{0};
+  std::chrono::steady_clock::time_point backup_deadline_;
   std::chrono::steady_clock::time_point validation_retry_after_{};
   std::chrono::steady_clock::time_point validation_deadline_;
 
@@ -147,6 +168,14 @@ private:
   void validateNextTarget(uint64_t generation);
   bool validationIsCurrent(uint64_t generation) const;
   void cancelFrontierValidation();
+  void handleValidationFailure(const std::string &reason);
+  void scheduleValidationRetry();
+  void recoveryTick();
+  void startBackup();
+  void cancelBackup();
+  void cancelPlanning();
+  void cancelNavigation();
+  void publishStage(const std::string &stage);
 
   frontier_exploration::FrontierSearch search_;
   rclcpp::TimerBase::SharedPtr exploring_timer_;
@@ -200,6 +229,14 @@ private:
   double roi_weight_{1.0};
   double frontier_endpoint_tolerance_{0.5};
   int frontier_validation_timeout_{90};
+  int frontier_validation_retries_{2};
+  double frontier_retry_delay_{2.0};
+  bool frontier_backup_enabled_{false};
+  double frontier_backup_distance_{1.0};
+  double frontier_backup_speed_{0.15};
+  double frontier_backup_time_allowance_{10.0};
+  double frontier_backup_server_timeout_{2.0};
+  double frontier_backup_wall_timeout_{30.0};
   int recent_frontier_history_size_{20};
 };
 }  // namespace explore

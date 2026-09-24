@@ -239,6 +239,60 @@ std::string describeNavigationStart(
   return description.str();
 }
 
+bool navigationStartAppearsBlocked(
+  const nav2_msgs::msg::Costmap & navigation_map,
+  const geometry_msgs::msg::Point & robot_point)
+{
+  const auto & metadata = navigation_map.metadata;
+  const auto & origin = metadata.origin.position;
+  unsigned int containing_x, containing_y;
+  if (!validNavigationMap(navigation_map) || !std::isfinite(robot_point.z) ||
+    !worldToCell(
+      robot_point, origin.x, origin.y, metadata.resolution,
+      metadata.size_x, metadata.size_y, containing_x, containing_y))
+  {
+    return false;
+  }
+
+  // Humble NavFn rounds coordinates instead of selecting the containing cell.
+  const double rounded_x = std::round((robot_point.x - origin.x) / metadata.resolution);
+  const double rounded_y = std::round((robot_point.y - origin.y) / metadata.resolution);
+  if (rounded_x < 0.0 || rounded_y < 0.0 ||
+    rounded_x >= metadata.size_x || rounded_y >= metadata.size_y)
+  {
+    return false;
+  }
+  const auto x = static_cast<unsigned int>(rounded_x);
+  const auto y = static_cast<unsigned int>(rounded_y);
+  const auto cost = [&](unsigned int cell_x, unsigned int cell_y) {
+      return navigation_map.data[
+        static_cast<std::size_t>(cell_y) * metadata.size_x + cell_x];
+    };
+  const auto blocked = [](unsigned char value) {
+      return value == nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE ||
+             value == nav2_costmap_2d::LETHAL_OBSTACLE;
+    };
+  const auto containing_cost = cost(containing_x, containing_y);
+  const auto rounded_cost = cost(x, y);
+  // Missing start information is not evidence that an automatic retreat helps.
+  if (containing_cost == nav2_costmap_2d::NO_INFORMATION ||
+    rounded_cost == nav2_costmap_2d::NO_INFORMATION)
+  {
+    return false;
+  }
+  if (blocked(containing_cost) || blocked(rounded_cost)) {
+    return true;
+  }
+
+  // NavFn can clear its start cell yet remain unable to propagate out of it.
+  // Map boundaries or unknown neighbours alone must not trigger recovery.
+  if (x == 0 || y == 0 || x + 1 >= metadata.size_x || y + 1 >= metadata.size_y) {
+    return false;
+  }
+  return blocked(cost(x - 1, y)) && blocked(cost(x + 1, y)) &&
+         blocked(cost(x, y - 1)) && blocked(cost(x, y + 1));
+}
+
 std::vector<FrontierTarget> frontierTargets(
   nav2_costmap_2d::Costmap2D & raw,
   const nav2_msgs::msg::Costmap & navigation_map,

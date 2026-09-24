@@ -84,6 +84,15 @@ std::string describeNavigationStart(
   const nav2_msgs::msg::Costmap & navigation_map,
   const geometry_msgs::msg::Point & robot_point);
 
+// Evidence of an obstructed start in a saved Nav2 costmap, not a reachability
+// test. Check both containing and Humble NavFn-rounded cells and the rounded
+// cell's four immediate neighbours. Unknown or out-of-map start cells and
+// malformed inputs are inconclusive and return false. Callers must still let
+// Nav2 check whether a recovery movement is collision free.
+bool navigationStartAppearsBlocked(
+  const nav2_msgs::msg::Costmap & navigation_map,
+  const geometry_msgs::msg::Point & robot_point);
+
 // Check path validity and its endpoint's distance from the requested target.
 bool pathReachesTarget(
   const nav_msgs::msg::Path & path,

@@ -74,6 +74,22 @@ Explore::Explore()
   this->declare_parameter<int>("frontier_validation_timeout", 90);
   this->declare_parameter<double>("frontier_revisit_radius", 2.5);
   this->declare_parameter<int>("recent_frontier_history_size", 20);
+  frontier_validation_retries_ = declare_parameter<int>("frontier_validation_retries", 2);
+  frontier_retry_delay_ = declare_parameter<double>("frontier_retry_delay", 2.0);
+  frontier_backup_enabled_ = declare_parameter<bool>("frontier_backup_enabled", false);
+  frontier_backup_distance_ = declare_parameter<double>("frontier_backup_distance", 1.0);
+  frontier_backup_speed_ = declare_parameter<double>("frontier_backup_speed", 0.15);
+  frontier_backup_time_allowance_ = declare_parameter<double>("frontier_backup_time_allowance", 10.0);
+  frontier_backup_server_timeout_ = declare_parameter<double>("frontier_backup_server_timeout", 2.0);
+  frontier_backup_wall_timeout_ = declare_parameter<double>("frontier_backup_wall_timeout", 30.0);
+  const auto positive = [](double value) {return std::isfinite(value) && value > 0.0;};
+  if (frontier_validation_retries_ < 0 || !std::isfinite(frontier_retry_delay_) ||
+      frontier_retry_delay_ < 0.0 || !positive(frontier_backup_distance_) ||
+      !positive(frontier_backup_speed_) || !positive(frontier_backup_time_allowance_) ||
+      !positive(frontier_backup_server_timeout_) || !positive(frontier_backup_wall_timeout_)) {
+    throw std::invalid_argument(
+        "Retry count/delay must be nonnegative; backup distance, speed and timeouts must be finite and positive");
+  }
 
   this->get_parameter("planner_frequency", planner_frequency_);
   this->get_parameter("visualize", visualize_);
@@ -153,12 +169,10 @@ Explore::Explore()
       this, "compute_path_to_pose");
   navigation_costmap_client_ = create_client<nav2_msgs::srv::GetCostmap>(
       "global_costmap/get_costmap");
-  validation_timer_ = create_wall_timer(std::chrono::seconds(1), [this]() {
-    if (validation_active_ && std::chrono::steady_clock::now() > validation_deadline_) {
-      cancelFrontierValidation();
-      finishExploration(false, "Frontier validation batch exceeded its time budget");
-    }
-  });
+  backup_client_ = rclcpp_action::create_client<nav2_msgs::action::BackUp>(this, "backup");
+  // Keep retries responsive even when frontier discovery runs at a low frequency.
+  validation_timer_ = create_wall_timer(std::chrono::milliseconds(100),
+      [this]() {recoveryTick();});
 
   search_ = frontier_exploration::FrontierSearch(costmap_client_.getCostmap(),
                                                  potential_scale_, gain_scale_,
@@ -334,21 +348,18 @@ void Explore::makePlan()
     RCLCPP_DEBUG(logger_, "Waiting for robot pose before selecting a frontier");
     return;
   }
-  auto feedback =
-      std::make_shared<rs1_interfaces::action::ExploreToPose::Feedback>();
-  feedback->stage = validation_active_ ? "validating_frontier" :
-      (final_navigation_ ? "navigating_to_roi" : "exploring");
-  feedback->distance_to_target = static_cast<float>(std::hypot(
-      pose.position.x - target_pose_.pose.position.x,
-      pose.position.y - target_pose_.pose.position.y));
-  explore_to_pose_goal_handle_->publish_feedback(feedback);
+  publishStage(backup_in_flight_ ?
+      (backup_cancel_requested_ ? "stopping_backup" : "backing_up") :
+      retry_waiting_ ? "retrying_validation" : validation_active_ ? "validating_frontier" :
+      final_navigation_ ? "navigating_to_roi" : "exploring");
 
   // Finish one navigation leg before choosing another destination.
   // goal_active_ also covers a request awaiting acceptance by Nav2.
-  if (goal_active_ || validation_active_ ||
+  if (goal_active_ || planning_in_flight_ || backup_in_flight_ || validation_active_ ||
       std::chrono::steady_clock::now() < validation_retry_after_) {
     return;
   }
+  retry_waiting_ = false;
   if (!roi_attempted_since_frontier_ && roiIsKnownFree()) {
     RCLCPP_DEBUG(logger_, "ROI is known free; attempting direct navigation");
     sendNavigationGoal(target_pose_, true);
@@ -462,6 +473,9 @@ void Explore::reachedGoal(const NavigationGoalHandle::WrappedResult& result,
   switch (result.code) {
     case rclcpp_action::ResultCode::SUCCEEDED:
       RCLCPP_DEBUG(logger_, "Goal was successful");
+      failed_validation_batches_ = 0;
+      backup_attempted_ = false;
+      last_validation_failure_.clear();
       recent_frontier_goals_.push_back(destination);
       if (recent_frontier_goals_.size() >
           static_cast<std::size_t>(recent_frontier_history_size_)) {
@@ -512,11 +526,10 @@ void Explore::stop(bool finished_exploring)
 
   exploring_timer_->cancel();
   cancelFrontierValidation();
-  if (navigation_goal_handle_) {
-    move_base_client_->async_cancel_goal(navigation_goal_handle_);
-  }
+  cancelBackup();
+  cancelNavigation();
 
-  if (return_to_init_ && finished_exploring) {
+  if (return_to_init_ && finished_exploring && !goal_active_ && !backup_in_flight_) {
     returnToInitialPose();
   }
 }
@@ -531,8 +544,7 @@ void Explore::resume()
   }
 
   roi_attempted_since_frontier_ = false;
-  empty_validation_attempts_ = 0;
-  validation_retry_after_ = {};
+  // Preserve retry/backup budgets and pending cancellation across pause/resume.
   if (exploring_timer_->is_canceled()) {
     RCLCPP_INFO(logger_, "Exploration resuming.");
   }
@@ -554,6 +566,12 @@ rclcpp_action::GoalResponse Explore::exploreToPoseRequestCb(
   if (explore_to_pose_goal_handle_ && explore_to_pose_goal_handle_->is_active())
   {
     RCLCPP_WARN(logger_, "Rejecting goal: exploration is already active");
+    return rclcpp_action::GoalResponse::REJECT;
+  }
+
+  // A previous task can finish before a slow action server confirms cancellation.
+  if (goal_active_ || planning_in_flight_ || backup_in_flight_) {
+    RCLCPP_WARN(logger_, "Rejecting goal: previous Nav2 action cleanup is still pending");
     return rclcpp_action::GoalResponse::REJECT;
   }
 
@@ -597,7 +615,10 @@ void Explore::exploreToPoseAcceptedCb(const std::shared_ptr<rclcpp_action::Serve
   cancelFrontierValidation();
   explore_to_pose_goal_handle_ = goal_handle;
   target_pose_ = goal_handle->get_goal()->target_pose;
-  empty_validation_attempts_ = 0;
+  failed_validation_batches_ = 0;
+  retry_waiting_ = false;
+  backup_attempted_ = false;
+  last_validation_failure_.clear();
   validation_retry_after_ = {};
 
   final_navigation_ = false;
@@ -630,15 +651,236 @@ void Explore::cancelFrontierValidation()
     navigation_costmap_client_->remove_pending_request(costmap_request_id_);
     costmap_request_id_ = -1;
   }
-  if (planning_goal_handle_ && rclcpp::ok()) {
+  cancelPlanning();
+  // Retain ownership until the terminal result, including after pause.
+}
+
+void Explore::publishStage(const std::string &stage)
+{
+  if (!explore_to_pose_goal_handle_ || !explore_to_pose_goal_handle_->is_active()) {
+    return;
+  }
+  auto feedback = std::make_shared<rs1_interfaces::action::ExploreToPose::Feedback>();
+  feedback->stage = stage;
+  geometry_msgs::msg::Pose pose;
+  if (costmap_client_.getRobotPose(pose)) {
+    feedback->distance_to_target = static_cast<float>(std::hypot(
+        pose.position.x - target_pose_.pose.position.x,
+        pose.position.y - target_pose_.pose.position.y));
+  }
+  explore_to_pose_goal_handle_->publish_feedback(feedback);
+}
+
+void Explore::scheduleValidationRetry()
+{
+  retry_waiting_ = true;
+  validation_retry_after_ = std::chrono::steady_clock::now() +
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+          std::chrono::duration<double>(frontier_retry_delay_));
+  publishStage("retrying_validation");
+}
+
+void Explore::handleValidationFailure(const std::string &reason)
+{
+  last_validation_failure_ = reason;
+  ++failed_validation_batches_;
+  const bool start_blocked = validation_start_blocked_;
+  cancelFrontierValidation();
+  if (failed_validation_batches_ > static_cast<unsigned int>(frontier_validation_retries_)) {
+    finishExploration(false, "No valid frontier after " +
+        std::to_string(failed_validation_batches_) + " failed batches" +
+        (start_blocked ? "; start appears blocked in the global costmap" : "") +
+        (backup_attempted_ ? "; backup already attempted: " : ": ") + reason);
+    return;
+  }
+  RCLCPP_WARN(logger_,
+      "Frontier batch %u failed (%s); retry %u/%d%s",
+      failed_validation_batches_, reason.c_str(), failed_validation_batches_,
+      frontier_validation_retries_, start_blocked ? "; start appears blocked" : "");
+  // Always refresh once before moving. A global-map diagnostic only permits an
+  // attempt: Nav2's local footprint collision checker decides whether it can move.
+  if (failed_validation_batches_ >= 2 && start_blocked &&
+      frontier_backup_enabled_ && !backup_attempted_) {
+    startBackup();
+  } else {
+    scheduleValidationRetry();
+  }
+}
+
+void Explore::recoveryTick()
+{
+  if (!exploring_timer_) {
+    return;
+  }
+  const auto current = std::chrono::steady_clock::now();
+  if (validation_active_ && current > validation_deadline_) {
+    finishExploration(false, "Frontier validation batch exceeded its time budget");
+  }
+  if (backup_in_flight_ && !backup_cancel_requested_ && current > backup_deadline_) {
+    finishExploration(false, std::string(backup_goal_handle_ ?
+        "Backup exceeded its wall-clock watchdog" : "Backup goal acceptance timed out") +
+        "; cancellation pending until Nav2 confirms termination; " + last_validation_failure_);
+  }
+  if (planning_cancel_requested_) {
+    cancelPlanning();
+  }
+  if (backup_cancel_requested_) {
+    cancelBackup();
+  }
+  if (navigation_cancel_requested_) {
+    cancelNavigation();
+  }
+  if (retry_waiting_ && !exploring_timer_->is_canceled() &&
+      !goal_active_ && !planning_in_flight_ && !backup_in_flight_ && !validation_active_ &&
+      current >= validation_retry_after_) {
+    makePlan();
+  }
+}
+
+void Explore::cancelPlanning()
+{
+  if (!planning_in_flight_) {
+    return;
+  }
+  planning_cancel_requested_ = true;
+  if (planning_goal_handle_ && !planning_cancel_sent_ && rclcpp::ok()) {
     try {
       planner_client_->async_cancel_goal(planning_goal_handle_);
+      planning_cancel_sent_ = true;
     } catch (const std::exception &error) {
       RCLCPP_WARN_THROTTLE(logger_, *get_clock(), 5000,
-          "Could not cancel frontier planning: %s", error.what());
+          "Could not cancel planning; retrying cleanup: %s", error.what());
     }
   }
-  planning_goal_handle_.reset();
+}
+
+void Explore::cancelBackup()
+{
+  if (!backup_in_flight_) {
+    return;
+  }
+  backup_cancel_requested_ = true;
+  if (backup_goal_handle_ && !backup_cancel_sent_ && rclcpp::ok()) {
+    try {
+      backup_client_->async_cancel_goal(backup_goal_handle_);
+      backup_cancel_sent_ = true;
+    } catch (const std::exception &error) {
+      RCLCPP_WARN_THROTTLE(logger_, *get_clock(), 5000,
+          "Could not cancel backup; movement remains gated: %s", error.what());
+    }
+  }
+  // Do not release ownership on a cancellation request/acknowledgement. The
+  // result confirms termination; late acceptance is handled by its callback.
+}
+
+void Explore::cancelNavigation()
+{
+  if (!goal_active_) {
+    return;
+  }
+  navigation_cancel_requested_ = true;
+  if (navigation_goal_handle_ && !navigation_cancel_sent_ && rclcpp::ok()) {
+    try {
+      move_base_client_->async_cancel_goal(navigation_goal_handle_);
+      navigation_cancel_sent_ = true;
+    } catch (const std::exception &error) {
+      RCLCPP_WARN_THROTTLE(logger_, *get_clock(), 5000,
+          "Could not cancel navigation; movement remains gated: %s", error.what());
+    }
+  }
+}
+
+void Explore::startBackup()
+{
+  if (goal_active_ || planning_in_flight_ || backup_in_flight_) {
+    finishExploration(false, "Cannot start backup while another owned Nav2 action is pending");
+    return;
+  }
+  backup_attempted_ = true;
+  if (!backup_client_->action_server_is_ready()) {
+    finishExploration(false, "Backup action server unavailable; " + last_validation_failure_);
+    return;
+  }
+  backup_in_flight_ = true;
+  backup_cancel_requested_ = false;
+  backup_cancel_sent_ = false;
+  backup_goal_handle_.reset();
+  const auto generation = ++backup_generation_;
+  const auto task = explore_to_pose_goal_handle_;
+  backup_deadline_ = std::chrono::steady_clock::now() +
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+          std::chrono::duration<double>(frontier_backup_server_timeout_));
+  nav2_msgs::action::BackUp::Goal goal;
+  goal.target.x = frontier_backup_distance_;
+  goal.speed = static_cast<float>(frontier_backup_speed_);
+  goal.time_allowance = rclcpp::Duration::from_seconds(frontier_backup_time_allowance_);
+  RCLCPP_INFO(logger_, "Attempting one collision-checked backup (%.2f m at %.2f m/s)",
+      frontier_backup_distance_, frontier_backup_speed_);
+  publishStage("backing_up");
+
+  rclcpp_action::Client<nav2_msgs::action::BackUp>::SendGoalOptions options;
+  options.goal_response_callback = [this, generation, task](BackupGoalHandle::SharedPtr handle) {
+    if (generation != backup_generation_) {
+      // Generations cannot advance while an older request is still owned.
+      return;
+    }
+    backup_goal_handle_ = handle;
+    const bool interrupted = backup_cancel_requested_ ||
+        task != explore_to_pose_goal_handle_ || exploring_timer_->is_canceled();
+    if (!handle) {
+      backup_in_flight_ = false;
+      backup_cancel_requested_ = false;
+      backup_cancel_sent_ = false;
+      if (task != explore_to_pose_goal_handle_) {
+        return;
+      }
+      if (interrupted) {
+        scheduleValidationRetry();
+      } else {
+        finishExploration(false, "Nav2 rejected the backup goal; " + last_validation_failure_);
+      }
+      return;
+    }
+    if (interrupted) {
+      cancelBackup();
+      return;
+    }
+    backup_deadline_ = std::chrono::steady_clock::now() +
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(frontier_backup_wall_timeout_));
+  };
+  options.result_callback = [this, generation, task](const BackupGoalHandle::WrappedResult &result) {
+    if (generation != backup_generation_) {
+      return;
+    }
+    const bool interrupted = backup_cancel_requested_ || exploring_timer_->is_canceled();
+    backup_in_flight_ = false;
+    backup_goal_handle_.reset();
+    backup_cancel_requested_ = false;
+    backup_cancel_sent_ = false;
+    if (task != explore_to_pose_goal_handle_) {
+      return;
+    }
+    if (interrupted) {
+      // Pause spends the single backup attempt. Resume can only refresh/replan.
+      scheduleValidationRetry();
+      return;
+    }
+    if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
+      RCLCPP_INFO(logger_, "Backup completed; refreshing maps before frontier validation");
+      scheduleValidationRetry();
+    } else {
+      finishExploration(false,
+          "Backup failed or was canceled by Nav2; check behavior-server logs for collision/timeout details; " +
+          last_validation_failure_);
+    }
+  };
+  try {
+    backup_client_->async_send_goal(goal, options);
+  } catch (const std::exception &error) {
+    backup_in_flight_ = false;
+    finishExploration(false, std::string("Could not send backup goal: ") + error.what());
+  }
 }
 
 void Explore::validateFrontiers(
@@ -651,6 +893,8 @@ void Explore::validateFrontiers(
     return;
   }
   validation_active_ = true;
+  validation_start_blocked_ = false;
+  publishStage("validating_frontier");
   const auto generation = ++validation_generation_;
   validation_deadline_ = std::chrono::steady_clock::now() +
       std::chrono::seconds(frontier_validation_timeout_);
@@ -678,6 +922,8 @@ void Explore::validateFrontiers(
               validation_retry_after_ = std::chrono::steady_clock::now() + std::chrono::seconds(2);
               return;
             }
+            validation_start_blocked_ = navigationStartAppearsBlocked(
+                *validation_costmap_, robot_pose.position);
             RCLCPP_DEBUG(logger_, "%s", describeNavigationStart(
                 *validation_costmap_, robot_pose.position).c_str());
             std::size_t revisit_excluded = 0;
@@ -692,25 +938,14 @@ void Explore::validateFrontiers(
             validation_detour_announced_ = false;
             validation_target_index_ = 0;
             if (validation_targets_.empty()) {
-              if (++empty_validation_attempts_ < 3) {
-                RCLCPP_DEBUG(logger_,
-                    "No frontier approach cell passed clearance checks and distance/ROI/revisit policy; refreshing maps (attempt %u/3)",
-                    empty_validation_attempts_);
-                cancelFrontierValidation();
-                validation_retry_after_ = std::chrono::steady_clock::now() +
-                    std::chrono::seconds(2);
-              } else {
-                std::string message = frontier_options_.allow_backtracking ?
-                    "No known-free frontier approach cell passed Nav2 costmap clearance checks and distance/ROI/revisit policy after 3 snapshots" :
-                    "No known-free ROI-progress approach cell passed Nav2 clearance checks and distance/revisit policy after 3 snapshots; backtracking is disabled";
-                if (revisit_excluded > 0) {
-                  message += "; recently visited approach regions remain excluded to prevent cycling";
-                }
-                finishExploration(false, message);
+              std::string reason =
+                  "No known-free frontier approach cell passed clearance and distance/ROI/revisit policy";
+              if (revisit_excluded > 0) {
+                reason += "; recently visited regions remain excluded";
               }
+              handleValidationFailure(reason);
               return;
             }
-            empty_validation_attempts_ = 0;
             size_t tier_counts[4] = {0, 0, 0, 0};
             for (const auto &target : validation_targets_) {
               ++tier_counts[target.tier];
@@ -741,7 +976,7 @@ void Explore::validateNextTarget(uint64_t generation)
     return;
   }
   if (validation_target_index_ >= validation_targets_.size()) {
-    finishExploration(false, frontier_options_.allow_backtracking ?
+    handleValidationFailure(frontier_options_.allow_backtracking ?
         "None of the sampled frontier targets passed Nav2 path validation; enable DEBUG logging for rejection details and check Nav2 planner logs" :
         "No sampled ROI-progress target passed Nav2 path validation; backtracking is disabled");
     return;
@@ -763,15 +998,14 @@ void Explore::validateNextTarget(uint64_t generation)
 
   rclcpp_action::Client<nav2_msgs::action::ComputePathToPose>::SendGoalOptions options;
   options.goal_response_callback = [this, generation](PlanningGoalHandle::SharedPtr handle) {
+    planning_goal_handle_ = handle;
+    if (!handle) {
+      planning_in_flight_ = false;
+      planning_cancel_requested_ = false;
+      planning_cancel_sent_ = false;
+    }
     if (!validationIsCurrent(generation)) {
-      if (handle && rclcpp::ok()) {
-        try {
-          planner_client_->async_cancel_goal(handle);
-        } catch (const std::exception &error) {
-          RCLCPP_WARN_THROTTLE(logger_, *get_clock(), 5000,
-              "Could not cancel stale frontier planning: %s", error.what());
-        }
-      }
+      cancelPlanning();
       return;
     }
     if (!handle) {
@@ -780,14 +1014,16 @@ void Explore::validateNextTarget(uint64_t generation)
       validateNextTarget(generation);
       return;
     }
-    planning_goal_handle_ = handle;
   };
   options.result_callback = [this, generation, target, pose](
       const PlanningGoalHandle::WrappedResult &result) {
+    planning_in_flight_ = false;
+    planning_cancel_requested_ = false;
+    planning_cancel_sent_ = false;
+    planning_goal_handle_.reset();
     if (!validationIsCurrent(generation)) {
       return;
     }
-    planning_goal_handle_.reset();
     // Preserve the reason: a planner abort is different from rejecting a
     // successful path whose endpoint only satisfies NavFn's tolerance fallback.
     if (result.code != rclcpp_action::ResultCode::SUCCEEDED) {
@@ -923,8 +1159,12 @@ void Explore::validateNextTarget(uint64_t generation)
     sendNavigationGoal(navigation_pose, false, target.frontier_centroid);
   };
   try {
+    planning_in_flight_ = true;
+    planning_cancel_requested_ = false;
+    planning_cancel_sent_ = false;
     planner_client_->async_send_goal(goal, options);
   } catch (const std::exception &error) {
+    planning_in_flight_ = false;
     finishExploration(false, std::string("Could not validate frontier path: ") + error.what());
   }
 }
@@ -943,68 +1183,82 @@ void Explore::sendNavigationGoal(
     const geometry_msgs::msg::PoseStamped &pose, bool to_roi,
     const geometry_msgs::msg::Point &frontier_identity)
 {
+  if (goal_active_ || backup_in_flight_ || planning_in_flight_) {
+    return;
+  }
   final_navigation_ = to_roi;
   if (to_roi) {
     roi_attempted_since_frontier_ = true;
   }
   goal_active_ = true;
+  navigation_cancel_requested_ = false;
+  navigation_cancel_sent_ = false;
+  const auto generation = ++navigation_generation_;
+  const auto task = explore_to_pose_goal_handle_;
 
   nav2_msgs::action::NavigateToPose::Goal goal;
   goal.pose = pose;
   goal.pose.header.stamp = this->now();
+  publishStage(to_roi ? "navigating_to_roi" : "exploring");
 
   rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions options;
   options.goal_response_callback =
-      [this, pose, to_roi, frontier_identity](NavigationGoalHandle::SharedPtr handle) {
-        if (!handle) {
-          goal_active_ = false;
-          final_navigation_ = false;
-          navigation_goal_handle_.reset();
-          if (!to_roi) {
-            frontier_blacklist_.push_back(frontier_identity);
-          }
-          RCLCPP_WARN(logger_, "Nav2 rejected %s goal",
-                      to_roi ? "ROI" : "frontier");
+      [this, generation, task, pose, to_roi, frontier_identity](NavigationGoalHandle::SharedPtr handle) {
+        if (generation != navigation_generation_) {
           return;
         }
         navigation_goal_handle_ = handle;
-
-        // A pause may have arrived while Nav2 was accepting the goal.
-        if (exploring_timer_->is_canceled()) {
-          move_base_client_->async_cancel_goal(handle);
+        const bool interrupted = navigation_cancel_requested_ ||
+            task != explore_to_pose_goal_handle_ || exploring_timer_->is_canceled();
+        if (!handle) {
+          goal_active_ = false;
+          final_navigation_ = false;
+          navigation_cancel_requested_ = false;
+          navigation_cancel_sent_ = false;
+          if (!interrupted) {
+            if (!to_roi) {
+              frontier_blacklist_.push_back(frontier_identity);
+            }
+            RCLCPP_WARN(logger_, "Nav2 rejected %s goal", to_roi ? "ROI" : "frontier");
+          }
+          return;
+        }
+        // Also catches a pause followed by resume before acceptance arrives.
+        if (interrupted) {
+          cancelNavigation();
         } else {
           RCLCPP_INFO(logger_, "Navigating to %s (%.2f, %.2f)",
               to_roi ? "ROI" : "frontier", pose.pose.position.x, pose.pose.position.y);
         }
       };
-
   options.result_callback =
-      [this, pose, to_roi, frontier_identity](
+      [this, generation, task, pose, to_roi, frontier_identity](
           const NavigationGoalHandle::WrappedResult &result) {
-        if (!explore_to_pose_goal_handle_) {
+        if (generation != navigation_generation_) {
           return;
         }
+        const bool interrupted = navigation_cancel_requested_ || exploring_timer_->is_canceled();
         navigation_goal_handle_.reset();
-
-        if (!to_roi) {
-          reachedGoal(result, frontier_identity, pose.pose.position);
-          return;
-        }
-
         goal_active_ = false;
         final_navigation_ = false;
-        if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
+        navigation_cancel_requested_ = false;
+        navigation_cancel_sent_ = false;
+        if (task != explore_to_pose_goal_handle_) {
+          return;
+        }
+        if (interrupted) {
+          scheduleValidationRetry();
+          return;
+        }
+        if (!to_roi) {
+          reachedGoal(result, frontier_identity, pose.pose.position);
+        } else if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
           finishExploration(true, "Reached the ROI");
         } else {
-          if (exploring_timer_->is_canceled()) {
-            RCLCPP_DEBUG(logger_, "ROI navigation ended while exploration was stopped");
-          } else {
-            RCLCPP_WARN(logger_, "ROI navigation did not succeed; resuming exploration");
-          }
+          RCLCPP_WARN(logger_, "ROI navigation did not succeed; resuming exploration");
           makePlan();
         }
       };
-
   try {
     move_base_client_->async_send_goal(goal, options);
   } catch (const std::exception &error) {
@@ -1026,9 +1280,10 @@ void Explore::finishExploration(bool success, const std::string &message)
 
   exploring_timer_->cancel();
   cancelFrontierValidation();
-  goal_active_ = false;
+  retry_waiting_ = false;
+  cancelBackup();
+  cancelNavigation();
   final_navigation_ = false;
-  navigation_goal_handle_.reset();
 
   auto result = std::make_shared<rs1_interfaces::action::ExploreToPose::Result>();
   result->message = message;

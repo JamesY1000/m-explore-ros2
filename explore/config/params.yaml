@@ -30,3 +30,18 @@
 
     # Total wall-clock seconds available for validating one candidate batch.
     frontier_validation_timeout: 90
+
+    # Per stalled selection: original batch + two fresh-map retries.
+    # Budgets reset on a reached frontier/new task, not on pause/resume.
+    frontier_validation_retries: 2
+    frontier_retry_delay: 2.0  # wall seconds; also settle time after backup
+    # Explicitly enabled for this Parrot setup; the node default is false.
+    # Attempt once after the first retry if the global planning start appears blocked.
+    frontier_backup_enabled: true
+    frontier_backup_distance: 1.0  # metres, backwards in the robot's current heading
+    frontier_backup_speed: 0.15  # metres/second
+    frontier_backup_time_allowance: 10.0  # Nav2 simulation/ROS seconds
+    frontier_backup_server_timeout: 2.0  # wall seconds for goal acceptance
+    # Independent watchdog, including a paused/slow simulation. Increase if needed.
+    # On expiry cancel and retain ownership until Nav2 confirms termination.
+    frontier_backup_wall_timeout: 30.0
