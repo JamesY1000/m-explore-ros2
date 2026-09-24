@@ -131,17 +131,17 @@ Explore::Explore()
     throw std::invalid_argument("Frontier distances and weights must be finite and nonnegative; "
         "preferred_frontier_distance must be positive");
   }
-  RCLCPP_INFO(logger_,
+  RCLCPP_DEBUG(logger_,
       "ROI-directed selection: minimum distance %.2f m, preferred distance %.2f m, "
       "minimum progress %.2f m, backtracking %s, ROI weight %.2f",
       frontier_options_.minimum_distance, frontier_options_.preferred_distance,
       frontier_options_.min_roi_progress,
       frontier_options_.allow_backtracking ? "allowed as fallback" : "disabled", roi_weight_);
 
-  RCLCPP_INFO(logger_,
+  RCLCPP_DEBUG(logger_,
       "Frontier validation: endpoint tolerance %.3f m, batch timeout %d s",
       frontier_endpoint_tolerance_, frontier_validation_timeout_);
-  RCLCPP_INFO(logger_,
+  RCLCPP_DEBUG(logger_,
       "Frontier revisit filter: radius %.2f m, history %d successful destinations",
       frontier_options_.revisit_radius, recent_frontier_history_size_);
 
@@ -194,12 +194,12 @@ Explore::Explore()
       "explore/resume", 10,
       std::bind(&Explore::resumeCallback, this, std::placeholders::_1));
 
-  RCLCPP_INFO(logger_, "Waiting to connect to move_base nav2 server");
+  RCLCPP_INFO(logger_, "Waiting for Nav2 navigation server");
   move_base_client_->wait_for_action_server();
-  RCLCPP_INFO(logger_, "Connected to move_base nav2 server");
+  RCLCPP_DEBUG(logger_, "Connected to Nav2 navigation server");
 
   if (return_to_init_) {
-    RCLCPP_INFO(logger_, "Getting initial pose of the robot");
+    RCLCPP_DEBUG(logger_, "Getting initial pose of the robot");
     geometry_msgs::msg::TransformStamped transformStamped;
     std::string map_frame = costmap_client_.getGlobalFrameID();
     try {
@@ -222,7 +222,7 @@ Explore::Explore()
   // Cancel the timer so it starts off action call. Reenable it when we starting exploration
   exploring_timer_->cancel();
 
-  RCLCPP_INFO(this->get_logger(), "Waiting for an ExploreToPose goal");
+  RCLCPP_INFO(logger_, "Explorer ready; waiting for an ExploreToPose goal");
 
   // // Start exploration right away
   // auto status_msg = explore_lite_msgs::msg::ExploreStatus();
@@ -330,8 +330,8 @@ void Explore::makePlan()
   // find frontiers
   geometry_msgs::msg::Pose pose;
   if (!costmap_client_.getRobotPose(pose)) {
-    RCLCPP_WARN_THROTTLE(logger_, *get_clock(), 5000,
-        "Waiting for robot pose before selecting a frontier");
+    // Costmap2DClient reports the underlying TF failure with throttling.
+    RCLCPP_DEBUG(logger_, "Waiting for robot pose before selecting a frontier");
     return;
   }
   auto feedback =
@@ -350,7 +350,7 @@ void Explore::makePlan()
     return;
   }
   if (!roi_attempted_since_frontier_ && roiIsKnownFree()) {
-    RCLCPP_INFO(logger_, "ROI is known free; attempting direct navigation");
+    RCLCPP_DEBUG(logger_, "ROI is known free; attempting direct navigation");
     sendNavigationGoal(target_pose_, true);
     return;
   }
@@ -430,6 +430,10 @@ void Explore::returnToInitialPose()
           status_msg.status = explore_lite_msgs::msg::ExploreStatus::RETURNED_TO_ORIGIN;
           status_pub_->publish(status_msg);
           RCLCPP_INFO(logger_, "Successfully returned to initial pose.");
+        } else if (result.code == rclcpp_action::ResultCode::CANCELED) {
+          RCLCPP_DEBUG(logger_, "Return to initial pose was canceled");
+        } else {
+          RCLCPP_WARN(logger_, "Navigation back to initial pose failed");
         }
       };
   move_base_client_->async_send_goal(goal, send_goal_options);
@@ -466,7 +470,9 @@ void Explore::reachedGoal(const NavigationGoalHandle::WrappedResult& result,
       roi_attempted_since_frontier_ = false;
       break;
     case rclcpp_action::ResultCode::ABORTED:
-      RCLCPP_DEBUG(logger_, "Goal aborted; blacklisting frontier");
+      RCLCPP_WARN(logger_,
+          "Navigation to frontier (%.2f, %.2f) failed; blacklisting it and trying another",
+          destination.x, destination.y);
       frontier_blacklist_.push_back(frontier_goal);
       break;
     case rclcpp_action::ResultCode::CANCELED:
@@ -474,7 +480,7 @@ void Explore::reachedGoal(const NavigationGoalHandle::WrappedResult& result,
       // If goal canceled might be because exploration stopped from topic. Don't make new plan.
       return;
     default:
-      RCLCPP_WARN(logger_, "Unknown result code from move base nav2");
+      RCLCPP_WARN(logger_, "Unknown navigation result from Nav2");
       break;
   }
   // This node uses the default mutually exclusive callback group.
@@ -483,7 +489,9 @@ void Explore::reachedGoal(const NavigationGoalHandle::WrappedResult& result,
 
 void Explore::start()
 {
-  RCLCPP_INFO(logger_, "Exploration started.");
+  RCLCPP_INFO(logger_, "Exploration started toward ROI (%.2f, %.2f) in %s",
+      target_pose_.pose.position.x, target_pose_.pose.position.y,
+      target_pose_.header.frame_id.c_str());
   auto status_msg = explore_lite_msgs::msg::ExploreStatus();
   status_msg.status = explore_lite_msgs::msg::ExploreStatus::EXPLORATION_STARTED;
   status_pub_->publish(status_msg);
@@ -491,7 +499,9 @@ void Explore::start()
 
 void Explore::stop(bool finished_exploring)
 {
-  RCLCPP_INFO(logger_, "Exploration stopped.");
+  if (!exploring_timer_->is_canceled()) {
+    RCLCPP_INFO(logger_, "Exploration stopped.");
+  }
 
   // Only publish paused status if manually stopped (not finished exploring)
   if (!finished_exploring) {
@@ -523,7 +533,9 @@ void Explore::resume()
   roi_attempted_since_frontier_ = false;
   empty_validation_attempts_ = 0;
   validation_retry_after_ = {};
-  RCLCPP_INFO(logger_, "Exploration resuming.");
+  if (exploring_timer_->is_canceled()) {
+    RCLCPP_INFO(logger_, "Exploration resuming.");
+  }
   auto status_msg = explore_lite_msgs::msg::ExploreStatus();
   status_msg.status = explore_lite_msgs::msg::ExploreStatus::EXPLORATION_IN_PROGRESS;
   status_pub_->publish(status_msg);
@@ -622,7 +634,8 @@ void Explore::cancelFrontierValidation()
     try {
       planner_client_->async_cancel_goal(planning_goal_handle_);
     } catch (const std::exception &error) {
-      RCLCPP_WARN(logger_, "Could not cancel frontier planning: %s", error.what());
+      RCLCPP_WARN_THROTTLE(logger_, *get_clock(), 5000,
+          "Could not cancel frontier planning: %s", error.what());
     }
   }
   planning_goal_handle_.reset();
@@ -660,19 +673,19 @@ void Explore::validateFrontiers(
                 std::move(response->map));
             geometry_msgs::msg::Pose robot_pose;
             if (!costmap_client_.getRobotPose(robot_pose)) {
-              RCLCPP_WARN(logger_, "Deferring frontier selection until robot pose is available");
+              RCLCPP_DEBUG(logger_, "Deferring frontier selection until robot pose is available");
               cancelFrontierValidation();
               validation_retry_after_ = std::chrono::steady_clock::now() + std::chrono::seconds(2);
               return;
             }
-            RCLCPP_INFO(logger_, "%s", describeNavigationStart(
+            RCLCPP_DEBUG(logger_, "%s", describeNavigationStart(
                 *validation_costmap_, robot_pose.position).c_str());
             std::size_t revisit_excluded = 0;
             validation_targets_ = directedFrontierTargets(
                 *costmap_client_.getCostmap(), *validation_costmap_, frontiers,
                 robot_pose.position, target_pose_.pose.position, frontier_options_,
                 recent_frontier_goals_, &revisit_excluded);
-            RCLCPP_INFO(logger_,
+            RCLCPP_DEBUG(logger_,
                 "Frontier revisit filter excluded %zu approach cells near %zu recent "
                 "destinations (radius %.2f m)",
                 revisit_excluded, recent_frontier_goals_.size(), frontier_options_.revisit_radius);
@@ -680,7 +693,7 @@ void Explore::validateFrontiers(
             validation_target_index_ = 0;
             if (validation_targets_.empty()) {
               if (++empty_validation_attempts_ < 3) {
-                RCLCPP_WARN(logger_,
+                RCLCPP_DEBUG(logger_,
                     "No frontier approach cell passed clearance checks and distance/ROI/revisit policy; refreshing maps (attempt %u/3)",
                     empty_validation_attempts_);
                 cancelFrontierValidation();
@@ -702,7 +715,7 @@ void Explore::validateFrontiers(
             for (const auto &target : validation_targets_) {
               ++tier_counts[target.tier];
             }
-            RCLCPP_INFO(logger_,
+            RCLCPP_DEBUG(logger_,
                 "Checking %zu frontier approach candidates with Nav2 "
                 "(local progress: %zu, distant progress: %zu, local detour: %zu, distant detour: %zu)",
                 validation_targets_.size(), tier_counts[0], tier_counts[1],
@@ -729,13 +742,13 @@ void Explore::validateNextTarget(uint64_t generation)
   }
   if (validation_target_index_ >= validation_targets_.size()) {
     finishExploration(false, frontier_options_.allow_backtracking ?
-        "None of the sampled frontier targets passed Nav2 path validation; see rejection reasons above and Nav2 planner logs" :
+        "None of the sampled frontier targets passed Nav2 path validation; enable DEBUG logging for rejection details and check Nav2 planner logs" :
         "No sampled ROI-progress target passed Nav2 path validation; backtracking is disabled");
     return;
   }
   const auto target = validation_targets_[validation_target_index_++];
   if (target.tier >= 2 && !validation_detour_announced_) {
-    RCLCPP_WARN(logger_,
+    RCLCPP_DEBUG(logger_,
         "No sampled ROI-progress candidate passed validation; trying detour candidates");
     validation_detour_announced_ = true;
   }
@@ -755,13 +768,15 @@ void Explore::validateNextTarget(uint64_t generation)
         try {
           planner_client_->async_cancel_goal(handle);
         } catch (const std::exception &error) {
-          RCLCPP_WARN(logger_, "Could not cancel stale frontier planning: %s", error.what());
+          RCLCPP_WARN_THROTTLE(logger_, *get_clock(), 5000,
+              "Could not cancel stale frontier planning: %s", error.what());
         }
       }
       return;
     }
     if (!handle) {
-      RCLCPP_WARN(logger_, "Nav2 rejected frontier path validation request");
+      RCLCPP_WARN_THROTTLE(logger_, *get_clock(), 5000,
+          "Nav2 rejected frontier path validation request");
       validateNextTarget(generation);
       return;
     }
@@ -779,14 +794,14 @@ void Explore::validateNextTarget(uint64_t generation)
       const char *status = result.code == rclcpp_action::ResultCode::ABORTED ?
           "ABORTED" : result.code == rclcpp_action::ResultCode::CANCELED ?
           "CANCELED" : "UNKNOWN";
-      RCLCPP_WARN(logger_,
+      RCLCPP_DEBUG(logger_,
           "Frontier target (%.2f, %.2f): Nav2 planner returned %s; inspect planner logs for cause",
           target.position.x, target.position.y, status);
       validateNextTarget(generation);
       return;
     }
     if (!result.result) {
-      RCLCPP_WARN(logger_,
+      RCLCPP_WARN_THROTTLE(logger_, *get_clock(), 5000,
           "Frontier target (%.2f, %.2f): Nav2 planner reported success without a result",
           target.position.x, target.position.y);
       validateNextTarget(generation);
@@ -799,7 +814,15 @@ void Explore::validateNextTarget(uint64_t generation)
           std::numeric_limits<double>::infinity() :
           std::hypot(path.poses.back().pose.position.x - target.position.x,
               path.poses.back().pose.position.y - target.position.y);
-      RCLCPP_WARN(logger_,
+      // Validate against the path's own endpoint to distinguish malformed data
+      // from a valid path that simply misses the requested target.
+      if (path.poses.empty() || !pathReachesTarget(
+              path, path.poses.back().pose.position, pose.header.frame_id, 0.0)) {
+        RCLCPP_WARN_THROTTLE(logger_, *get_clock(), 5000,
+            "Nav2 planner reported success with an empty, nonfinite, or incorrectly framed path; "
+            "trying another candidate (enable DEBUG for details)");
+      }
+      RCLCPP_DEBUG(logger_,
           "Frontier target (%.2f, %.2f): Nav2 succeeded but path/endpoint validation failed "
           "(poses=%zu, frame='%s', expected='%s', endpoint error=%.3f m); "
           "require nonempty finite path in expected frame and endpoint within %.3f m",
@@ -821,7 +844,7 @@ void Explore::validateNextTarget(uint64_t generation)
 
     // A planner-adjusted endpoint must not slip back into a recently visited region.
     if (isNearRecentGoal(destination, recent_frontier_goals_, frontier_options_.revisit_radius)) {
-      RCLCPP_WARN(logger_,
+      RCLCPP_DEBUG(logger_,
           "Planned frontier endpoint (%.2f, %.2f) is within the revisit radius "
           "of a recent destination; trying next candidate",
           destination.x, destination.y);
@@ -834,7 +857,7 @@ void Explore::validateNextTarget(uint64_t generation)
     // replans against the live costmap after receiving this destination.
     if (!isFrontierTargetValid(*costmap_client_.getCostmap(),
             *validation_costmap_, destination)) {
-      RCLCPP_WARN(logger_,
+      RCLCPP_DEBUG(logger_,
           "Planned frontier endpoint (%.2f, %.2f) failed known-free or costmap clearance "
           "checks against current exploration map and selection costmap snapshot",
           destination.x, destination.y);
@@ -843,7 +866,7 @@ void Explore::validateNextTarget(uint64_t generation)
     }
     geometry_msgs::msg::Pose robot_pose;
     if (!costmap_client_.getRobotPose(robot_pose)) {
-      RCLCPP_WARN(logger_, "Deferring frontier dispatch until robot pose is available");
+      RCLCPP_DEBUG(logger_, "Deferring frontier dispatch until robot pose is available");
       cancelFrontierValidation();
       validation_retry_after_ = std::chrono::steady_clock::now() + std::chrono::seconds(2);
       return;
@@ -859,7 +882,7 @@ void Explore::validateNextTarget(uint64_t generation)
     // Apply this to progress targets and detours before sending navigation.
     if (!std::isfinite(target_distance) ||
         target_distance < frontier_options_.minimum_distance) {
-      RCLCPP_WARN(logger_,
+      RCLCPP_DEBUG(logger_,
           "Planned frontier endpoint (%.2f, %.2f) failed minimum distance check "
           "(distance=%.3f m, minimum=%.3f m); trying next candidate",
           destination.x, destination.y, target_distance, frontier_options_.minimum_distance);
@@ -870,7 +893,7 @@ void Explore::validateNextTarget(uint64_t generation)
     const double current_progress = std::hypot(robot.x - roi.x, robot.y - roi.y) -
         std::hypot(destination.x - roi.x, destination.y - roi.y);
     if (target.tier < 2 && current_progress + 1e-6 < frontier_options_.min_roi_progress) {
-      RCLCPP_WARN(logger_,
+      RCLCPP_DEBUG(logger_,
           "Planned frontier endpoint (%.2f, %.2f) no longer satisfies ROI progress "
           "after planning; trying next candidate",
           destination.x, destination.y);
@@ -887,7 +910,7 @@ void Explore::validateNextTarget(uint64_t generation)
     const double endpoint_shift = std::hypot(
         destination.x - target.position.x, destination.y - target.position.y);
     const char *tier_names[] = {"local_progress", "distant_progress", "local_detour", "distant_detour"};
-    RCLCPP_INFO(logger_,
+    RCLCPP_DEBUG(logger_,
         "Validated frontier goal (%.2f, %.2f), requested (%.2f, %.2f), shift=%.3f m, "
         "centroid (%.2f, %.2f), path has %zu poses; "
         "tier=%s, ROI progress=%.2f m, target distance=%.2f m, path length=%.2f m, "
@@ -949,6 +972,9 @@ void Explore::sendNavigationGoal(
         // A pause may have arrived while Nav2 was accepting the goal.
         if (exploring_timer_->is_canceled()) {
           move_base_client_->async_cancel_goal(handle);
+        } else {
+          RCLCPP_INFO(logger_, "Navigating to %s (%.2f, %.2f)",
+              to_roi ? "ROI" : "frontier", pose.pose.position.x, pose.pose.position.y);
         }
       };
 
@@ -970,7 +996,11 @@ void Explore::sendNavigationGoal(
         if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
           finishExploration(true, "Reached the ROI");
         } else {
-          RCLCPP_WARN(logger_, "ROI navigation did not succeed; resuming exploration");
+          if (exploring_timer_->is_canceled()) {
+            RCLCPP_DEBUG(logger_, "ROI navigation ended while exploration was stopped");
+          } else {
+            RCLCPP_WARN(logger_, "ROI navigation did not succeed; resuming exploration");
+          }
           makePlan();
         }
       };
@@ -1007,10 +1037,10 @@ void Explore::finishExploration(bool success, const std::string &message)
     auto status = explore_lite_msgs::msg::ExploreStatus();
     status.status = explore_lite_msgs::msg::ExploreStatus::EXPLORATION_COMPLETE;
     status_pub_->publish(status);
-    RCLCPP_INFO(logger_, "%s", message.c_str());
+    RCLCPP_INFO(logger_, "Exploration complete: %s", message.c_str());
   } else {
     explore_to_pose_goal_handle_->abort(result);
-    RCLCPP_WARN(logger_, "%s", message.c_str());
+    RCLCPP_WARN(logger_, "Exploration failed: %s", message.c_str());
   }
   explore_to_pose_goal_handle_.reset();
 }
