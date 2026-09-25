@@ -211,6 +211,7 @@ private:
       const geometry_msgs::msg::PoseStamped &pose, bool to_roi,
       const geometry_msgs::msg::Point &frontier_identity = geometry_msgs::msg::Point());
   void finishExploration(bool success, const std::string &message);
+  void finishCancelledExploration();
 
   bool final_navigation_{false};
   bool roi_attempted_since_frontier_{false};

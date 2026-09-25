@@ -603,10 +603,14 @@ rclcpp_action::GoalResponse Explore::exploreToPoseRequestCb(
 rclcpp_action::CancelResponse Explore::exploreToPoseCancelRequestCb(
   const std::shared_ptr<rclcpp_action::ServerGoalHandle<rs1_interfaces::action::ExploreToPose>> goal_handle)
 {
-  // Keep cancellation unsupported until navigation cleanup is implemented.
-  (void)goal_handle;
-  RCLCPP_WARN(logger_, "Exploration cancellation is not implemented yet");
-  return rclcpp_action::CancelResponse::REJECT;
+  // Only cancel the current exploration task
+  if (!goal_handle || goal_handle != explore_to_pose_goal_handle_ || !goal_handle->is_active()) {
+    return rclcpp_action::CancelResponse::REJECT;
+  }
+
+  // Stop new exploration work and cancel any owned Nav2 actions
+  stop();
+  return rclcpp_action::CancelResponse::ACCEPT;
 }
 
 void Explore::exploreToPoseAcceptedCb(const std::shared_ptr<rclcpp_action::ServerGoalHandle<rs1_interfaces::action::ExploreToPose>> goal_handle)
@@ -657,7 +661,8 @@ void Explore::cancelFrontierValidation()
 
 void Explore::publishStage(const std::string &stage)
 {
-  if (!explore_to_pose_goal_handle_ || !explore_to_pose_goal_handle_->is_active()) {
+  if (!explore_to_pose_goal_handle_ || !explore_to_pose_goal_handle_->is_active() ||
+      explore_to_pose_goal_handle_->is_canceling()) {
     return;
   }
   auto feedback = std::make_shared<rs1_interfaces::action::ExploreToPose::Feedback>();
@@ -729,6 +734,12 @@ void Explore::recoveryTick()
   }
   if (navigation_cancel_requested_) {
     cancelNavigation();
+  }
+
+  // ROS marks the task CANCELING after the cancel callback returns
+  if (explore_to_pose_goal_handle_ && explore_to_pose_goal_handle_->is_canceling()) {
+    finishCancelledExploration();
+    return;
   }
   if (retry_waiting_ && !exploring_timer_->is_canceled() &&
       !goal_active_ && !planning_in_flight_ && !backup_in_flight_ && !validation_active_ &&
@@ -1274,7 +1285,7 @@ void Explore::sendNavigationGoal(
 
 void Explore::finishExploration(bool success, const std::string &message)
 {
-  if (!explore_to_pose_goal_handle_) {
+  if (!explore_to_pose_goal_handle_ || explore_to_pose_goal_handle_->is_canceling()) {
     return;
   }
 
@@ -1298,6 +1309,23 @@ void Explore::finishExploration(bool success, const std::string &message)
     RCLCPP_WARN(logger_, "Exploration failed: %s", message.c_str());
   }
   explore_to_pose_goal_handle_.reset();
+}
+
+void Explore::finishCancelledExploration()
+{
+  // Keep the task active until all owned Nav2 actions have stopped
+  if (!explore_to_pose_goal_handle_ || !explore_to_pose_goal_handle_->is_canceling() ||
+      goal_active_ || planning_in_flight_ || backup_in_flight_) {
+    return;
+  }
+
+  auto result = std::make_shared<rs1_interfaces::action::ExploreToPose::Result>();
+  result->message = "Exploration to ROI was canceled";
+  explore_to_pose_goal_handle_->canceled(result);
+  explore_to_pose_goal_handle_.reset();
+  retry_waiting_ = false;
+  final_navigation_ = false;
+  RCLCPP_INFO(logger_, "%s", result->message.c_str());
 }
 
 bool Explore::validPose(const geometry_msgs::msg::PoseStamped &pose)
