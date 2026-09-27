@@ -208,7 +208,7 @@ Explore::Explore()
       "explore/resume", 10,
       std::bind(&Explore::resumeCallback, this, std::placeholders::_1));
 
-  RCLCPP_INFO(logger_, "Waiting for Nav2 navigation server");
+  RCLCPP_DEBUG(logger_, "Waiting for Nav2 navigation server");
   move_base_client_->wait_for_action_server();
   RCLCPP_DEBUG(logger_, "Connected to Nav2 navigation server");
 
@@ -878,7 +878,7 @@ void Explore::startBackup()
       return;
     }
     if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
-      RCLCPP_INFO(logger_, "Backup completed; refreshing maps before frontier validation");
+      RCLCPP_DEBUG(logger_, "Backup completed; refreshing maps before frontier validation");
       scheduleValidationRetry();
     } else {
       finishExploration(false,
@@ -1238,7 +1238,7 @@ void Explore::sendNavigationGoal(
         if (interrupted) {
           cancelNavigation();
         } else {
-          RCLCPP_INFO(logger_, "Navigating to %s (%.2f, %.2f)",
+          RCLCPP_DEBUG(logger_, "Navigating to %s (%.2f, %.2f)",
               to_roi ? "ROI" : "frontier", pose.pose.position.x, pose.pose.position.y);
         }
       };

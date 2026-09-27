@@ -84,7 +84,7 @@ Costmap2DClient::Costmap2DClient(rclcpp::Node& node, const tf2_ros::Buffer* tf)
 
   // Spin some until the callback gets called to replicate
   // ros::topic::waitForMessage
-  RCLCPP_INFO(node_.get_logger(),
+  RCLCPP_DEBUG(node_.get_logger(),
               "Waiting for costmap to become available, topic: %s",
               costmap_topic.c_str());
   while (!costmap_received_) {
