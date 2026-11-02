@@ -537,7 +537,7 @@ void Explore::stop(bool finished_exploring)
 void Explore::resume()
 {
   // Make sure it only starts when it receives an active goal handle
-  if (!explore_to_pose_goal_handle_ || !explore_to_pose_goal_handle_->is_active() ||
+  if (finish_pending_ || !explore_to_pose_goal_handle_ || !explore_to_pose_goal_handle_->is_active() ||
       explore_to_pose_goal_handle_->is_canceling())
   {
     return;
@@ -615,6 +615,7 @@ rclcpp_action::CancelResponse Explore::exploreToPoseCancelRequestCb(
 
 void Explore::exploreToPoseAcceptedCb(const std::shared_ptr<rclcpp_action::ServerGoalHandle<rs1_interfaces::action::ExploreToPose>> goal_handle)
 {
+  finish_pending_ = false;
   // Start exploration with target pose and enable timer
   cancelFrontierValidation();
   explore_to_pose_goal_handle_ = goal_handle;
@@ -739,6 +740,10 @@ void Explore::recoveryTick()
   // ROS marks the task CANCELING after the cancel callback returns
   if (explore_to_pose_goal_handle_ && explore_to_pose_goal_handle_->is_canceling()) {
     finishCancelledExploration();
+    return;
+  }
+  if (finish_pending_) {
+    finishExploration(finish_success_, finish_message_);
     return;
   }
   if (retry_waiting_ && !exploring_timer_->is_canceled() &&
@@ -1289,24 +1294,36 @@ void Explore::finishExploration(bool success, const std::string &message)
     return;
   }
 
-  exploring_timer_->cancel();
-  cancelFrontierValidation();
+  if (!finish_pending_) {
+    finish_pending_ = true;
+    finish_success_ = success;
+    finish_message_ = message;
+    exploring_timer_->cancel();
+    cancelFrontierValidation();
+    retry_waiting_ = false;
+    cancelBackup();
+    cancelNavigation();
+    final_navigation_ = false;
+  }
+
+  // Resume must not start new navigation while an old backup or goal is still stopping
+  if (goal_active_ || planning_in_flight_ || backup_in_flight_) {
+    return;
+  }
+  finish_pending_ = false;
   retry_waiting_ = false;
-  cancelBackup();
-  cancelNavigation();
-  final_navigation_ = false;
 
   auto result = std::make_shared<rs1_interfaces::action::ExploreToPose::Result>();
-  result->message = message;
-  if (success) {
+  result->message = finish_message_;
+  if (finish_success_) {
     explore_to_pose_goal_handle_->succeed(result);
     auto status = explore_lite_msgs::msg::ExploreStatus();
     status.status = explore_lite_msgs::msg::ExploreStatus::EXPLORATION_COMPLETE;
     status_pub_->publish(status);
-    RCLCPP_INFO(logger_, "Exploration complete: %s", message.c_str());
+    RCLCPP_INFO(logger_, "Exploration complete: %s", finish_message_.c_str());
   } else {
     explore_to_pose_goal_handle_->abort(result);
-    RCLCPP_WARN(logger_, "Exploration failed: %s", message.c_str());
+    RCLCPP_WARN(logger_, "Exploration failed: %s", finish_message_.c_str());
   }
   explore_to_pose_goal_handle_.reset();
 }
@@ -1322,6 +1339,7 @@ void Explore::finishCancelledExploration()
   auto result = std::make_shared<rs1_interfaces::action::ExploreToPose::Result>();
   result->message = "Exploration to ROI was canceled";
   explore_to_pose_goal_handle_->canceled(result);
+  finish_pending_ = false;
   explore_to_pose_goal_handle_.reset();
   retry_waiting_ = false;
   final_navigation_ = false;

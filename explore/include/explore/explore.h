@@ -211,6 +211,10 @@ private:
       const geometry_msgs::msg::PoseStamped &pose, bool to_roi,
       const geometry_msgs::msg::Point &frontier_identity = geometry_msgs::msg::Point());
   void finishExploration(bool success, const std::string &message);
+  // Keep the parent action owned until every old Nav2 action has stopped
+  bool finish_pending_{false};
+  bool finish_success_{false};
+  std::string finish_message_;
   void finishCancelledExploration();
 
   bool final_navigation_{false};
